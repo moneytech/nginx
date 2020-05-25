@@ -178,6 +178,7 @@ static void ngx_http_v2_read_client_request_body_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_v2_terminate_stream(ngx_http_v2_connection_t *h2c,
     ngx_http_v2_stream_t *stream, ngx_uint_t status);
 static void ngx_http_v2_close_stream_handler(ngx_event_t *ev);
+static void ngx_http_v2_retry_close_stream_handler(ngx_event_t *ev);
 static void ngx_http_v2_handle_connection_handler(ngx_event_t *rev);
 static void ngx_http_v2_idle_handler(ngx_event_t *rev);
 static void ngx_http_v2_finalize_connection(ngx_http_v2_connection_t *h2c,
@@ -730,9 +731,8 @@ ngx_http_v2_state_preface(ngx_http_v2_connection_t *h2c, u_char *pos,
     }
 
     if (ngx_memcmp(pos, preface, sizeof(preface) - 1) != 0) {
-        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, h2c->connection->log, 0,
-                       "invalid http2 connection preface \"%*s\"",
-                       sizeof(preface) - 1, pos);
+        ngx_log_error(NGX_LOG_INFO, h2c->connection->log, 0,
+                      "invalid connection preface");
 
         return ngx_http_v2_connection_error(h2c, NGX_HTTP_V2_PROTOCOL_ERROR);
     }
@@ -753,9 +753,8 @@ ngx_http_v2_state_preface_end(ngx_http_v2_connection_t *h2c, u_char *pos,
     }
 
     if (ngx_memcmp(pos, preface, sizeof(preface) - 1) != 0) {
-        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, h2c->connection->log, 0,
-                       "invalid http2 connection preface \"%*s\"",
-                       sizeof(preface) - 1, pos);
+        ngx_log_error(NGX_LOG_INFO, h2c->connection->log, 0,
+                      "invalid connection preface");
 
         return ngx_http_v2_connection_error(h2c, NGX_HTTP_V2_PROTOCOL_ERROR);
     }
@@ -1718,8 +1717,13 @@ ngx_http_v2_state_header_complete(ngx_http_v2_connection_t *h2c, u_char *pos,
     ngx_http_v2_stream_t  *stream;
 
     if (h2c->state.length) {
-        h2c->state.handler = ngx_http_v2_state_header_block;
-        return pos;
+        if (end - pos > 0) {
+            h2c->state.handler = ngx_http_v2_state_header_block;
+            return pos;
+        }
+
+        return ngx_http_v2_state_headers_save(h2c, pos, end,
+                                              ngx_http_v2_state_header_block);
     }
 
     if (!(h2c->state.flags & NGX_HTTP_V2_END_HEADERS_FLAG)) {
@@ -2464,10 +2468,6 @@ ngx_http_v2_connection_error(ngx_http_v2_connection_t *h2c,
 {
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, h2c->connection->log, 0,
                    "http2 state connection error");
-
-    if (err == NGX_HTTP_V2_INTERNAL_ERROR) {
-        ngx_debug_point();
-    }
 
     ngx_http_v2_finalize_connection(h2c, err);
 
@@ -4288,8 +4288,9 @@ ngx_http_v2_close_stream(ngx_http_v2_stream_t *stream, ngx_int_t rc)
     fc = stream->request->connection;
 
     if (stream->queued) {
-        fc->write->handler = ngx_http_v2_close_stream_handler;
-        fc->read->handler = ngx_http_empty_handler;
+        fc->error = 1;
+        fc->write->handler = ngx_http_v2_retry_close_stream_handler;
+        fc->read->handler = ngx_http_v2_retry_close_stream_handler;
         return;
     }
 
@@ -4406,6 +4407,22 @@ ngx_http_v2_close_stream_handler(ngx_event_t *ev)
         ngx_http_v2_close_stream(r->stream, NGX_HTTP_REQUEST_TIME_OUT);
         return;
     }
+
+    ngx_http_v2_close_stream(r->stream, 0);
+}
+
+
+static void
+ngx_http_v2_retry_close_stream_handler(ngx_event_t *ev)
+{
+    ngx_connection_t    *fc;
+    ngx_http_request_t  *r;
+
+    fc = ev->data;
+    r = fc->data;
+
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, fc->log, 0,
+                   "http2 retry close stream handler");
 
     ngx_http_v2_close_stream(r->stream, 0);
 }
